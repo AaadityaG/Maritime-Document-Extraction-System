@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api", tags=["Documents"])
 async def extract_document(
     document: UploadFile = File(...),
     sessionId: Optional[str] = Form(None),
-    mode: str = Query("sync", description="sync or async mode")
+    mode: str = Query("async", description="sync or async mode")
 ):
     """Extract structured data from uploaded document"""
     # Validate file type

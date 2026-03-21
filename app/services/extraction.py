@@ -3,15 +3,15 @@
 import hashlib
 import json
 import time
+import re
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models import Extraction, Session
 from app.schemas import ExtractionRecord, FieldExtraction, ValidityInfo, ComplianceInfo, MedicalData, Flag, Confidence
 from app.services.llm_provider import get_llm_provider
-from app.services.ocr_provider import ocr_service
 from app.utils.prompts import EXTRACTION_PROMPT
 from app.core.config import settings
 
@@ -19,6 +19,34 @@ from app.core.config import settings
 def calculate_file_hash(file_data: bytes) -> str:
     """Calculate SHA-256 hash of file data"""
     return hashlib.sha256(file_data).hexdigest()
+
+
+def extract_json_from_response(response: str | Dict[str, Any]) -> str:
+    """
+    Extract clean JSON from LLM response.
+    Handles markdown code fences, extra text, etc.
+    """
+    # If already a dict, convert to JSON string
+    if isinstance(response, dict):
+        return json.dumps(response)
+    
+    # Remove markdown code fences
+    response = re.sub(r'^```(?:json)?\s*', '', response, flags=re.MULTILINE)
+    response = re.sub(r'\s*```$', '', response, flags=re.MULTILINE)
+    
+    # Find JSON between braces (handles nested braces)
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if match:
+        return match.group()
+    
+    # Fallback: try to find JSON-like content
+    start = response.find('{')
+    end = response.rfind('}') + 1
+    if start != -1 and end > start:
+        return response[start:end]
+    
+    # Last resort: return as-is and let json.loads handle it
+    return response
 
 
 class ExtractionService:
@@ -61,44 +89,52 @@ class ExtractionService:
         await self.db.refresh(extraction)
         
         try:
-            # STEP 1: Extract raw text using OCR FIRST
-            print(f"📝 Extracting raw text from {file_name}...")
-            raw_text = await ocr_service.extract_text(file_data, mime_type)
-            
-            if raw_text:
-                extraction.raw_ocr_text = raw_text
-                await self.db.commit()
-                print(f"✅ Raw text extracted: {len(raw_text)} characters")
-            else:
-                print("⚠️  OCR extraction failed or returned empty text")
-            
-            # STEP 2: Send to LLM for structured extraction
-            print(f"🤖 Sending to LLM for structured extraction...")
+            # STEP 1: Call LLM for extraction
+            print(f"🤖 Sending {file_name} to LLM for structured extraction...")
             llm_response = await self.llm_provider.extract_document(
                 file_data=file_data,
                 mime_type=mime_type,
                 prompt=EXTRACTION_PROMPT
             )
             
-            # Store raw response
-            extraction.raw_llm_response = json.dumps(llm_response)
+            # STEP 2: ALWAYS store raw response (REQUIRED by spec)
+            extraction.raw_llm_response = json.dumps(llm_response) if isinstance(llm_response, dict) else llm_response
+            await self.db.commit()
             
-            # Parse and structure the response
-            structured_data = self._structure_extraction(llm_response, session_id, file_name)
+            # STEP 3: Extract clean JSON from response
+            print("📝 Parsing LLM response...")
+            clean_json_str = extract_json_from_response(llm_response)
+            print(f"✅ Clean JSON extracted: {len(clean_json_str)} characters")
             
-            # Update extraction record
+            # STEP 4: Parse JSON
+            try:
+                result = json.loads(clean_json_str)
+                print("✅ JSON parsed successfully")
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON parsing failed: {e}")
+                print(f"Raw response: {clean_json_str[:500]}...")
+                raise ValueError(f"LLM returned invalid JSON: {str(e)}")
+            
+            # STEP 5: Map fields explicitly
+            print("🔧 Mapping extracted fields...")
+            structured_data = self._structure_extraction(result, session_id, file_name)
+            
+            # STEP 6: Update extraction record with mapped data
             await self._update_extraction(extraction, structured_data, start_time)
             
+            print(f"✅ Extraction complete for {file_name}")
             return structured_data, False
             
         except Exception as e:
             # Mark as failed but keep the record with whatever data we have
             extraction.status = "FAILED"
-            extraction.raw_llm_response = f"Error: {str(e)}"
+            # Always store raw response even on failure (REQUIRED by spec)
+            if not extraction.raw_llm_response:
+                extraction.raw_llm_response = f"Error: {str(e)}"
             await self.db.commit()
             
-            # Even if LLM fails, return what we have (OCR text at least)
-            print(f"❌ LLM extraction failed, but OCR text may be available in database")
+            print(f"❌ Extraction failed for {file_name}: {str(e)}")
+            print(f"💾 Raw LLM response stored in database for debugging")
             raise
     
     async def _find_by_hash(self, session_id: str, file_hash: str) -> Optional[ExtractionRecord]:
@@ -116,7 +152,7 @@ class ExtractionService:
         return None
     
     def _structure_extraction(self, llm_data: dict, session_id: str, file_name: str) -> ExtractionRecord:
-        """Structure LLM response into ExtractionRecord"""
+        """Structure LLM response into ExtractionRecord with explicit field mapping"""
         detection = llm_data.get("detection", {})
         holder = llm_data.get("holder", {})
         validity = llm_data.get("validity", {})
@@ -135,10 +171,11 @@ class ExtractionService:
                 delta = expiry - datetime.utcnow()
                 days_until_expiry = delta.days
                 is_expired = days_until_expiry < 0
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️  Failed to parse expiry date: {e}")
         
-        return ExtractionRecord(
+        # Map fields explicitly
+        extraction_record = ExtractionRecord(
             id=str(int(time.time())),
             sessionId=session_id,
             fileName=file_name,
@@ -166,10 +203,23 @@ class ExtractionService:
             summary=llm_data.get("summary"),
             status="COMPLETE"
         )
+        
+        return extraction_record
     
     async def _update_extraction(self, extraction: Extraction, structured_data: ExtractionRecord, start_time: float):
         """Update database extraction record with structured data"""
         processing_time = int((time.time() - start_time) * 1000)
+        
+        # Map fields explicitly with logging
+        print("🔧 Mapping extracted fields to database:")
+        print(f"   - document_type: {structured_data.documentType}")
+        print(f"   - applicable_role: {structured_data.applicableRole}")
+        print(f"   - confidence: {structured_data.confidence}")
+        print(f"   - holder_name: {structured_data.holderName}")
+        print(f"   - date_of_birth: {structured_data.dateOfBirth}")
+        print(f"   - sirb_number: {structured_data.sirbNumber}")
+        print(f"   - is_expired: {structured_data.isExpired}")
+        print(f"   - processing_time_ms: {processing_time}ms")
         
         extraction.document_type = structured_data.documentType.value if structured_data.documentType else None
         extraction.applicable_role = structured_data.applicableRole.value if structured_data.applicableRole else None
