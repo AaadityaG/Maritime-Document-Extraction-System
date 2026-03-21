@@ -1,2 +1,30 @@
+# FastAPI and server
 fastapi==0.109.0
 uvicorn==0.27.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.48
+aiosqlite==0.22.1
+
+# Validation
+pydantic==2.12.5
+pydantic-settings==2.13.1
+
+# Authentication (optional)
+python-jose==3.3.0
+passlib==1.7.4
+bcrypt==4.1.2
+
+# File handling
+pillow==12.1.1
+aiofiles==25.1.0
+
+# HTTP client
+httpx==0.28.1
+
+# Rate limiting
+slowapi==0.1.9
+
+# Environment
+python-dotenv==1.2.2
