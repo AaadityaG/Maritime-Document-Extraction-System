@@ -47,6 +47,7 @@ class Extraction(Base):
     is_expired = Column(Boolean, default=False)
     summary = Column(Text)
     raw_llm_response = Column(Text)
+    raw_ocr_text = Column(Text)  # Store raw OCR-extracted text
     processing_time_ms = Column(Integer)
     status = Column(String, default="COMPLETE")
     created_at = Column(DateTime, default=datetime.utcnow, index=True)

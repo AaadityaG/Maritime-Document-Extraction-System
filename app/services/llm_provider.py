@@ -6,6 +6,7 @@ import base64
 import httpx
 import json
 import re
+import asyncio
 from app.core.config import settings
 
 
@@ -38,6 +39,61 @@ class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        self.max_retries = 5
+        self.base_delay = 5.0  # Base delay in seconds (increased from 2s)
+    
+    async def _make_request_with_retry(self, client, url, params, payload, operation_name="request"):
+        """Make HTTP request with exponential backoff for rate limits"""
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = await client.post(url, params=params, json=payload)
+                
+                # Check for rate limit (429)
+                if response.status_code == 429:
+                    # Get Retry-After header or calculate backoff
+                    retry_after_header = response.headers.get('Retry-After')
+                    if retry_after_header:
+                        wait_time = int(retry_after_header)
+                    else:
+                        # Exponential backoff: 5s, 10s, 20s, 40s, 80s (capped at 60s)
+                        wait_time = min(int(self.base_delay * (2 ** attempt)), 60)
+                    
+                    print(f"⚠️  Rate limited for {operation_name}. Attempt {attempt + 1}/{self.max_retries}. Waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Raise for other errors
+                response.raise_for_status()
+                return response.json()
+                
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                if e.response.status_code == 429 and attempt < self.max_retries - 1:
+                    retry_after_header = e.response.headers.get('Retry-After')
+                    if retry_after_header:
+                        wait_time = int(retry_after_header)
+                    else:
+                        wait_time = min(int(self.base_delay * (2 ** attempt)), 60)
+                    
+                    print(f"⚠️  Rate limited for {operation_name}. Attempt {attempt + 1}/{self.max_retries}. Waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+            except httpx.RequestError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    wait_time = min(int(self.base_delay * (2 ** attempt)), 60)
+                    print(f"Request failed for {operation_name}: {str(e)}. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+        
+        # If we exhausted all retries, raise the last exception
+        if last_exception:
+            raise last_exception
+        raise Exception(f"Failed to complete {operation_name} after {self.max_retries} attempts")
     
     async def extract_document(
         self,
@@ -66,13 +122,13 @@ class GeminiProvider(LLMProvider):
         }
         
         async with httpx.AsyncClient(timeout=settings.JOB_TIMEOUT) as client:
-            response = await client.post(
+            result = await self._make_request_with_retry(
+                client,
                 f"{self.base_url}/models/{settings.LLM_MODEL}:generateContent",
-                params={"key": self.api_key},
-                json=payload
+                {"key": self.api_key},
+                payload,
+                "extract_document"
             )
-            response.raise_for_status()
-            result = response.json()
             
             # Extract text from response
             text = result["candidates"][0]["content"]["parts"][0]["text"]
@@ -94,13 +150,13 @@ class GeminiProvider(LLMProvider):
         }
         
         async with httpx.AsyncClient(timeout=settings.JOB_TIMEOUT) as client:
-            response = await client.post(
+            result = await self._make_request_with_retry(
+                client,
                 f"{self.base_url}/models/{settings.LLM_MODEL}:generateContent",
-                params={"key": self.api_key},
-                json=payload
+                {"key": self.api_key},
+                payload,
+                "validate_documents"
             )
-            response.raise_for_status()
-            result = response.json()
             text = result["candidates"][0]["content"]["parts"][0]["text"]
             return self._parse_json_response(text)
     

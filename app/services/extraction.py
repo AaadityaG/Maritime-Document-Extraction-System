@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.models import Extraction, Session
 from app.schemas import ExtractionRecord, FieldExtraction, ValidityInfo, ComplianceInfo, MedicalData, Flag, Confidence
 from app.services.llm_provider import get_llm_provider
+from app.services.ocr_provider import ocr_service
 from app.utils.prompts import EXTRACTION_PROMPT
 from app.core.config import settings
 
@@ -52,14 +53,27 @@ class ExtractionService:
             file_name=file_name,
             file_hash=file_hash,
             status="PROCESSING",
-            raw_llm_response=None
+            raw_llm_response=None,
+            raw_ocr_text=None  # Will store OCR text here
         )
         self.db.add(extraction)
         await self.db.commit()
         await self.db.refresh(extraction)
         
         try:
-            # Call LLM for extraction
+            # STEP 1: Extract raw text using OCR FIRST
+            print(f"📝 Extracting raw text from {file_name}...")
+            raw_text = await ocr_service.extract_text(file_data, mime_type)
+            
+            if raw_text:
+                extraction.raw_ocr_text = raw_text
+                await self.db.commit()
+                print(f"✅ Raw text extracted: {len(raw_text)} characters")
+            else:
+                print("⚠️  OCR extraction failed or returned empty text")
+            
+            # STEP 2: Send to LLM for structured extraction
+            print(f"🤖 Sending to LLM for structured extraction...")
             llm_response = await self.llm_provider.extract_document(
                 file_data=file_data,
                 mime_type=mime_type,
@@ -78,10 +92,13 @@ class ExtractionService:
             return structured_data, False
             
         except Exception as e:
-            # Mark as failed but keep the record
+            # Mark as failed but keep the record with whatever data we have
             extraction.status = "FAILED"
             extraction.raw_llm_response = f"Error: {str(e)}"
             await self.db.commit()
+            
+            # Even if LLM fails, return what we have (OCR text at least)
+            print(f"❌ LLM extraction failed, but OCR text may be available in database")
             raise
     
     async def _find_by_hash(self, session_id: str, file_hash: str) -> Optional[ExtractionRecord]:
@@ -197,5 +214,6 @@ class ExtractionService:
             createdAt=db_extraction.created_at,
             fileHash=db_extraction.file_hash,
             rawLlmResponse=db_extraction.raw_llm_response,
+            rawOcrText=db_extraction.raw_ocr_text,  # Include OCR text
             status=db_extraction.status
         )

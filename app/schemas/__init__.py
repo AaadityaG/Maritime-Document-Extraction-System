@@ -216,6 +216,7 @@ class ExtractionRecord(BaseModel):
     createdAt: datetime = Field(default_factory=datetime.utcnow)
     fileHash: Optional[str] = None
     rawLlmResponse: Optional[str] = None
+    rawOcrText: Optional[str] = None  # Raw OCR-extracted text
     status: str = "COMPLETE"
 
 

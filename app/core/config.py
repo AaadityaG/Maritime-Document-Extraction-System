@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_PERIOD: int = 60  # seconds
     
     # Job Processing
-    JOB_TIMEOUT: int = 30  # seconds
+    JOB_TIMEOUT: int = 300  # seconds (increased to handle extended retries for rate limits)
     ASYNC_THRESHOLD: int = 5 * 1024 * 1024  # 5MB
     
     # Database
