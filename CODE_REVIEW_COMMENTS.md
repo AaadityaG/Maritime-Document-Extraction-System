@@ -1,7 +1,6 @@
 # Code Review: feat: add document extraction endpoint
 
 **Reviewed by:** Senior Engineer  
-**Date:** March 22, 2026  
 **Overall Assessment:** ⚠️ **Needs Significant Revisions** - Has critical security, reliability, and architectural issues that must be addressed before merging.
 
 ---
